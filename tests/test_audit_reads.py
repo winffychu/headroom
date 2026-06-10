@@ -107,6 +107,45 @@ class TestAuditReads:
         assert r.sessions == 0
 
 
+class TestMaturationSim:
+    def test_metrics(self, transcript_dir):
+        from headroom.audit.maturation import simulate_maturation
+
+        r = simulate_maturation(transcript_dir)
+        assert r.read_calls == 3
+        # r2 and r3 target the already-read foo.py; r3 is partial.
+        assert r.rereads_any == 2
+        assert r.rereads_partial == 1
+        # CONTENT is ~1.2KB — below the 2KB maturation floor — so the
+        # big-read metrics stay empty on this fixture.
+        assert r.big_reads == 0
+        # The edit follows reads of the same file with touch-gap 1.
+        assert r.edits_with_prior_read == 1
+        assert r.at_risk_edits[1] == 0
+
+    def test_big_read_metrics(self, tmp_path):
+        from headroom.audit.maturation import MATURE_FLOOR, simulate_maturation
+
+        big = "x" * (MATURE_FLOOR + 100)
+        lines = [
+            _line("assistant", [_tool_use("r1", "Read", {"file_path": "/x/big.py"})]),
+            _line("user", [_tool_result("r1", big)]),
+        ]
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "s.jsonl").write_text("\n".join(lines))
+        r = simulate_maturation(tmp_path)
+        assert r.big_reads == 1
+        assert r.never_touched_again == 1
+
+    def test_render_runs(self, transcript_dir):
+        from headroom.audit.maturation import render_sim_text, simulate_maturation
+
+        out = render_sim_text(simulate_maturation(transcript_dir))
+        assert "maturation simulation" in out
+        assert "at-risk edits" in out
+
+
 class TestCli:
     def test_cli_text_and_json(self, transcript_dir):
         from click.testing import CliRunner
@@ -123,6 +162,33 @@ class TestCli:
         )
         assert res.exit_code == 0
         assert json.loads(res.output)["sessions"] == 1
+
+    def test_cli_simulate_maturation(self, transcript_dir):
+        from click.testing import CliRunner
+
+        from headroom.cli.main import main
+
+        runner = CliRunner()
+        res = runner.invoke(
+            main, ["audit-reads", "--path", str(transcript_dir), "--simulate-maturation"]
+        )
+        assert res.exit_code == 0, res.output
+        assert "maturation simulation" in res.output
+
+        res = runner.invoke(
+            main,
+            [
+                "audit-reads",
+                "--path",
+                str(transcript_dir),
+                "--simulate-maturation",
+                "--format",
+                "json",
+            ],
+        )
+        assert res.exit_code == 0
+        data = json.loads(res.output)
+        assert data["maturation_simulation"]["read_calls"] == 3
 
 
 if __name__ == "__main__":

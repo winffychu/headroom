@@ -22,7 +22,13 @@ from .main import main
     default="text",
     help="Output format (default: text)",
 )
-def audit_reads_cmd(root: Path | None, output_format: str) -> None:
+@click.option(
+    "--simulate-maturation",
+    is_flag=True,
+    help="Also simulate Mechanism B (read maturation): re-read rates, "
+    "never-touched-again share, quiesce-window coverage, at-risk edits.",
+)
+def audit_reads_cmd(root: Path | None, output_format: str, simulate_maturation: bool) -> None:
     """Audit Read-tool traffic for compression opportunities.
 
     Streams local Claude Code transcripts (read-only) and sizes the
@@ -52,7 +58,22 @@ def audit_reads_cmd(root: Path | None, output_format: str) -> None:
     if report.sessions == 0:
         raise click.ClickException(f"no *.jsonl transcripts found under {root}")
 
+    sim = None
+    if simulate_maturation:
+        from headroom.audit.maturation import render_sim_text
+        from headroom.audit.maturation import simulate_maturation as run_sim
+
+        sim = run_sim(root)
+
     if output_format == "json":
-        click.echo(report.to_json())
+        import json as _json
+
+        data = _json.loads(report.to_json())
+        if sim is not None:
+            data["maturation_simulation"] = sim.to_dict()
+        click.echo(_json.dumps(data, indent=2, sort_keys=True))
     else:
         click.echo(render_text(report))
+        if sim is not None:
+            click.echo()
+            click.echo(render_sim_text(sim))

@@ -267,22 +267,31 @@ class ReadMaturationConfig:
 
     Mechanics: a fresh large Read is held out of the provider prefix
     cache (the trailing cache breakpoint is relocated to just before it)
-    for `hold_requests` requests, during which the model sees it verbatim
-    and acts on it. On maturation the content is replaced with a
-    CCR-backed marker; only that final compressed form ever enters the
-    cache. No cached byte is ever mutated — there is nothing to bust.
+    while its file is ACTIVE, stays verbatim the whole time the model is
+    working with it, and matures into a CCR-backed marker once the file
+    has been quiet for `quiesce_turns`. Only that final compressed form
+    ever enters the cache. No cached byte is ever mutated — there is
+    nothing to bust.
 
-    Hold-back economics: holding costs (1.0 - read_discount) x size per
-    held request, repaid by skipping the cache-write premium on the
-    verbatim form and by every subsequent turn reading the small form.
-    Break-even is ~2 requests after maturation at 80% compression.
+    Activity-based (not a fixed hold window) because the audit-reads
+    simulation showed touch gaps are fat-tailed: next-touch p50 is 4
+    turns but p90 is 81 — no fixed window covers the tail, while a
+    quiesce rule covers the activity cluster and lets the tail self-heal
+    via the model's observed habit of re-reading ranges from disk (95%
+    of re-reads in real traffic are partial-range reads made while the
+    full text was still in context).
 
     Disabled by default while the mechanism is validated in pilots.
     """
 
     enabled: bool = False
-    # Requests a fresh Read stays verbatim (and uncached) before maturing.
-    hold_requests: int = 1
+    # Mature a held Read once its FILE has had no activity (reads or
+    # edits) for this many assistant turns. Simulation: next-touch p50
+    # is 4 turns, so 5 covers the median activity cluster.
+    quiesce_turns: int = 5
+    # Safety valve: mature regardless once held this many turns, bounding
+    # the hold-out cost for files that stay active for long stretches.
+    max_hold_turns: int = 25
     # Only hold/mature Reads at least this large; small Reads are cached
     # immediately as before (holding them costs more than it saves).
     min_size_bytes: int = 2048

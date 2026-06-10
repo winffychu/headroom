@@ -1,10 +1,12 @@
-"""Tests for Mechanism B: hold-back Read maturation.
+"""Tests for Mechanism B: activity-based hold-back Read maturation.
 
-The two invariants under test, beyond basic behavior:
+The invariants under test, beyond decision behavior:
 1. No cached byte is ever mutated — frozen-prefix content and content
    carrying a client cache_control breakpoint are untouched.
 2. Replay is deterministic — once matured, the same marker is applied on
    every subsequent request, byte-identical.
+3. Holding is derived from the conversation (file activity), so the
+   decision survives state loss; only matured markers are stateful.
 """
 
 from __future__ import annotations
@@ -36,6 +38,26 @@ def anthropic_read(tc_id: str, file_path: str, content: str) -> list[dict]:
     ]
 
 
+def anthropic_edit(tc_id: str, file_path: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tc_id,
+                    "name": "Edit",
+                    "input": {"file_path": file_path, "old_string": "a", "new_string": "b"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tc_id, "content": "ok"}],
+        },
+    ]
+
+
 def openai_read(tc_id: str, file_path: str, content: str) -> list[dict]:
     return [
         {
@@ -51,7 +73,15 @@ def openai_read(tc_id: str, file_path: str, content: str) -> list[dict]:
     ]
 
 
-def conv() -> list[dict]:
+def quiet(n: int) -> list[dict]:
+    """n assistant turns with no file activity (advances the quiet clock)."""
+    return [
+        {"role": "assistant", "content": [{"type": "text", "text": f"thinking {i}"}]}
+        for i in range(n)
+    ]
+
+
+def base_conv() -> list[dict]:
     return [{"role": "user", "content": "look"}, *anthropic_read("r1", "/x/foo.py", CONTENT)]
 
 
@@ -60,106 +90,141 @@ def manager(**overrides) -> ReadMaturationManager:
     return ReadMaturationManager(cfg)
 
 
-class TestStateMachine:
+def read_content(res, idx=2):
+    return res.messages[idx]["content"][0]["content"]
+
+
+class TestActivityDecision:
     def test_disabled_is_noop(self):
         m = ReadMaturationManager(ReadMaturationConfig(enabled=False))
-        res = m.apply(conv(), turn_number=1)
-        assert res.messages == conv()
+        res = m.apply(base_conv())
+        assert res.messages == base_conv()
         assert res.holding_msg_indices == []
 
-    def test_first_sight_holds_verbatim(self):
-        m = manager()
-        res = m.apply(conv(), turn_number=1)
-        # Content untouched, message flagged as holding.
-        assert res.messages[2]["content"][0]["content"] == CONTENT
+    def test_fresh_read_holds_verbatim(self):
+        res = manager().apply(base_conv())
+        assert read_content(res) == CONTENT
         assert res.holding_msg_indices == [2]
-        assert res.newly_held == 1
+        assert res.holding_reads == 1
         assert res.newly_matured == 0
 
-    def test_matures_after_hold_window(self):
-        m = manager(hold_requests=1)
-        m.apply(conv(), turn_number=1)
-        res = m.apply(conv(), turn_number=2)
+    def test_holds_while_file_quiet_below_quiesce(self):
+        msgs = [*base_conv(), *quiet(4)]  # quiet = 4 < 5
+        res = manager(quiesce_turns=5).apply(msgs)
+        assert res.holding_msg_indices == [2]
+        assert read_content(res) == CONTENT
 
+    def test_matures_after_quiesce(self):
+        msgs = [*base_conv(), *quiet(5)]  # quiet = 5 >= 5
+        res = manager(quiesce_turns=5).apply(msgs)
         assert res.newly_matured == 1
         assert res.holding_msg_indices == []
-        marker = res.messages[2]["content"][0]["content"]
+        marker = read_content(res)
         assert "compressed after use" in marker
         assert "/x/foo.py" in marker
         assert "Retrieve original: hash=" in marker
         assert res.bytes_saved > 0
 
-    def test_replay_is_deterministic(self):
-        m = manager(hold_requests=1)
-        m.apply(conv(), turn_number=1)
-        a = m.apply(conv(), turn_number=2).messages[2]["content"][0]["content"]
-        b = m.apply(conv(), turn_number=3).messages[2]["content"][0]["content"]
-        c = m.apply(conv(), turn_number=9).messages[2]["content"][0]["content"]
-        assert a == b == c
+    def test_file_activity_resets_quiet_clock(self):
+        # read, 4 quiet, edit same file, 4 quiet: quiet=4 < 5 → still held
+        msgs = [*base_conv(), *quiet(4), *anthropic_edit("e1", "/x/foo.py"), *quiet(4)]
+        res = manager(quiesce_turns=5).apply(msgs)
+        assert res.holding_msg_indices == [2]
+        # one more quiet turn → file quiesced → matures
+        res = manager(quiesce_turns=5).apply([*msgs, *quiet(1)])
+        assert res.newly_matured == 1
 
-    def test_longer_hold_window(self):
-        m = manager(hold_requests=3)
-        assert m.apply(conv(), turn_number=1).holding_msg_indices == [2]
-        assert m.apply(conv(), turn_number=2).holding_msg_indices == [2]
-        assert m.apply(conv(), turn_number=3).holding_msg_indices == [2]
-        res = m.apply(conv(), turn_number=4)
+    def test_activity_on_other_file_does_not_reset(self):
+        msgs = [*base_conv(), *quiet(3), *anthropic_edit("e1", "/x/OTHER.py"), *quiet(1)]
+        # foo.py quiet for 5 assistant turns (3 quiet + edit-turn + 1 quiet)
+        res = manager(quiesce_turns=5).apply(msgs)
+        assert res.newly_matured == 1
+
+    def test_max_hold_caps_busy_files(self):
+        # File touched every turn — never quiesces — but the hold cap fires.
+        msgs = base_conv()
+        for i in range(6):
+            msgs += anthropic_edit(f"e{i}", "/x/foo.py")
+        res = manager(quiesce_turns=100, max_hold_turns=6).apply(msgs)
         assert res.newly_matured == 1
         assert res.holding_msg_indices == []
 
+    def test_replay_is_deterministic_and_stateful(self):
+        m = manager(quiesce_turns=5)
+        matured_msgs = [*base_conv(), *quiet(5)]
+        a = read_content(m.apply(matured_msgs))
+        # Replay applies even when the conversation grows and the file is
+        # touched again later (matured is final).
+        later = [*matured_msgs, *anthropic_edit("e1", "/x/foo.py")]
+        b = read_content(m.apply(later))
+        c = read_content(m.apply([*later, *quiet(3)]))
+        assert a == b == c
+
     def test_small_reads_ignored(self):
-        msgs = [{"role": "user", "content": "look"}, *anthropic_read("r1", "/x/a.py", SMALL)]
-        m = manager()
-        res = m.apply(msgs, turn_number=1)
+        msgs = [
+            {"role": "user", "content": "look"},
+            *anthropic_read("r1", "/x/a.py", SMALL),
+            *quiet(10),
+        ]
+        res = manager().apply(msgs)
         assert res.holding_msg_indices == []
-        assert m.apply(msgs, turn_number=5).messages[2]["content"][0]["content"] == SMALL
+        assert read_content(res) == SMALL
 
     def test_frozen_prefix_untouched(self):
-        # A Read inside the frozen prefix (cached verbatim before this
-        # mechanism saw it) is never held or replaced.
-        m = manager(hold_requests=1)
-        msgs = conv()
-        res = m.apply(msgs, turn_number=1, frozen_message_count=len(msgs))
+        msgs = [*base_conv(), *quiet(10)]
+        m = manager(quiesce_turns=5)
+        res = m.apply(msgs, frozen_message_count=len(msgs))
         assert res.holding_msg_indices == []
-        res = m.apply(msgs, turn_number=5, frozen_message_count=len(msgs))
-        assert res.messages[2]["content"][0]["content"] == CONTENT
+        assert read_content(res) == CONTENT
 
     def test_respects_lifecycle_markers(self):
-        # read_lifecycle runs first; its marker output must pass through.
         marker = "[Read content stale: /x/foo.py ... Retrieve original: hash=abc123]" + " " * 2048
-        msgs = [{"role": "user", "content": "look"}, *anthropic_read("r1", "/x/foo.py", marker)]
-        m = manager()
-        res = m.apply(msgs, turn_number=1)
+        msgs = [
+            {"role": "user", "content": "look"},
+            *anthropic_read("r1", "/x/foo.py", marker),
+            *quiet(10),
+        ]
+        res = manager().apply(msgs)
         assert res.holding_msg_indices == []
+        assert res.newly_matured == 0
 
     def test_block_with_client_breakpoint_untouched(self):
-        msgs = conv()
+        msgs = [*base_conv(), *quiet(10)]
         msgs[2]["content"][0]["cache_control"] = {"type": "ephemeral"}
-        m = manager(hold_requests=1)
-        res = m.apply(msgs, turn_number=1)
+        res = manager().apply(msgs)
         assert res.holding_msg_indices == []
-        res = m.apply(msgs, turn_number=5)
         assert res.messages[2]["content"][0]["content"] == CONTENT
 
     def test_openai_format(self):
         msgs = [{"role": "user", "content": "look"}, *openai_read("r1", "/x/foo.py", CONTENT)]
-        m = manager(hold_requests=1)
-        res = m.apply(msgs, turn_number=1)
+        m = manager(quiesce_turns=5)
+        res = m.apply(msgs)
         assert res.holding_msg_indices == [2]
-        res = m.apply(msgs, turn_number=2)
+        res = m.apply([*msgs, *quiet(5)])
         assert "compressed after use" in res.messages[2]["content"]
 
-    def test_multiple_reads_independent_clocks(self):
-        m = manager(hold_requests=1)
-        msgs1 = conv()
-        m.apply(msgs1, turn_number=1)
-        msgs2 = [*msgs1, *anthropic_read("r2", "/x/bar.py", CONTENT)]
-        res = m.apply(msgs2, turn_number=2)
-        # r1 matured (held at turn 1); r2 just arrived, still holding.
-        assert res.newly_matured == 1
-        assert res.holding_msg_indices == [4]
-        res = m.apply(msgs2, turn_number=3)
-        assert res.newly_matured == 1  # r2 matures
-        assert res.holding_msg_indices == []
+    def test_files_mature_independently(self):
+        # foo.py quiet for ages; bar.py just read → foo matures, bar holds.
+        msgs = [
+            *base_conv(),
+            *quiet(6),
+            *anthropic_read("r2", "/x/bar.py", CONTENT),
+        ]
+        res = manager(quiesce_turns=5).apply(msgs)
+        assert res.newly_matured == 1  # foo.py
+        assert "compressed after use" in read_content(res, 2)
+        assert res.holding_msg_indices == [10]  # bar.py result message
+        assert read_content(res, 10) == CONTENT
+
+    def test_decision_survives_state_loss(self):
+        # A fresh manager (proxy restart) makes the same holding/matured
+        # decision because holding is derived from the conversation.
+        msgs = [*base_conv(), *quiet(5)]
+        first = read_content(manager(quiesce_turns=5).apply(msgs))
+        second = read_content(manager(quiesce_turns=5).apply(msgs))
+        assert "compressed after use" in first and "compressed after use" in second
+        # Markers differ only if CCR hashing differed — it must not.
+        assert first == second
 
 
 class TestCcrIntegration:
@@ -169,12 +234,11 @@ class TestCcrIntegration:
 
         store = CompressionStore(backend=InMemoryBackend())
         m = ReadMaturationManager(
-            ReadMaturationConfig(enabled=True, hold_requests=1), compression_store=store
+            ReadMaturationConfig(enabled=True, quiesce_turns=5), compression_store=store
         )
-        m.apply(conv(), turn_number=1)
-        res = m.apply(conv(), turn_number=2)
+        res = m.apply([*base_conv(), *quiet(5)])
 
-        marker = res.messages[2]["content"][0]["content"]
+        marker = read_content(res)
         ccr_hash = marker.split("hash=")[1].rstrip("]")
         entry = store.retrieve(ccr_hash)
         assert entry is not None
@@ -188,7 +252,6 @@ class TestBreakpointRelocation:
             {"role": "user", "content": [{"type": "text", "text": "earlier turn"}]},
             *anthropic_read("r1", "/x/foo.py", CONTENT),
         ]
-        # Client breakpoint on the last block of the last message.
         msgs[-1]["content"][-1] = {
             **msgs[-1]["content"][-1],
             "cache_control": {"type": "ephemeral"},
@@ -218,7 +281,6 @@ class TestBreakpointRelocation:
         # Read still gets cached.
         assert self._breakpoint_indices(out) == [1]
         assert out[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
-        # Total breakpoint count did not grow.
         assert len(self._breakpoint_indices(out)) <= len(self._breakpoint_indices(msgs))
 
     def test_noop_when_no_breakpoint_in_held_region(self):

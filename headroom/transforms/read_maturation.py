@@ -5,22 +5,34 @@ so mutating an already-cached Read is ruinously expensive — but bytes that
 have never been cache-written have no cache entry to bust. This module
 exploits the one safe window: a fresh Read is deliberately held *out* of
 the provider cache (the trailing cache breakpoint is relocated to just
-before it) for a bounded number of requests. The model sees the verbatim
-content exactly while it is hot. When the hold expires, the content is
-replaced with a CCR-backed marker — and only that final, small form ever
-enters the cache.
+before it) while its file is active. The model sees the verbatim content
+the whole time it is working with the file. Once the file has been quiet
+for `quiesce_turns`, the content is replaced with a CCR-backed marker —
+and only that final, small form ever enters the cache.
 
-Timeline for a Read first seen at request R (hold_requests=1):
+Timeline for a Read of file F (quiesce_turns=5):
 
-    R:    verbatim, NOT cached (breakpoint parked before it)
-    R+1:  replaced with marker; breakpoint returns to the tail; the
-          marker form is cache-written once
-    R+2…: marker form read from cache at the provider discount
+    turn T:      model reads F — verbatim, NOT cached
+    T+1..T+k:    model edits / re-reads F — read stays verbatim and
+                 uncached (every touch resets the quiet clock)
+    T+k+5:       F has been quiet 5 turns → read matures into a marker;
+                 the breakpoint returns to the tail; the marker form is
+                 cache-written once
+    later turns: marker form read from cache at the provider discount
+
+Why activity-based instead of a fixed hold window: the audit-reads
+simulation over real traffic showed touch gaps are fat-tailed (next-touch
+p50 = 4 turns, p90 = 81) — no fixed window covers the tail. The quiesce
+rule covers the activity cluster, `max_hold_turns` bounds the hold cost
+for pathologically busy files, and the tail self-heals through the
+model's *observed* habit of re-reading ranges from disk: 95% of re-reads
+in real traffic are partial-range reads made while the full text was
+still in context. The recovery path is the model's existing behavior.
 
 Two invariants:
 
 1. **No cached byte is ever mutated.** The verbatim form is never
-   cache-written, so the replacement at R+1 invalidates nothing.
+   cache-written, so maturation invalidates nothing.
 2. **Replay is deterministic.** Once matured, the same marker is applied
    on every subsequent request (state is session-scoped), so the cached
    prefix stays byte-stable for the rest of the session.
@@ -30,14 +42,16 @@ in the CCR compression store, the marker carries the retrieval hash and
 the file path, and the file itself remains on disk — a confused model
 re-reads at the cost of one tool call.
 
-State lives on the session's PrefixCacheTracker (same affinity and TTL
-cleanup as the prefix-freeze state). Per-process, like all session state:
-multi-worker deployments need sticky sessions (existing constraint).
+State (matured markers only — holding is derived from the conversation
+itself, so it survives state loss) lives with the session's prefix
+tracker. Per-process, like all session state: multi-worker deployments
+need sticky sessions (existing constraint).
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -48,23 +62,30 @@ logger = logging.getLogger(__name__)
 
 # Tool names whose results are eligible for maturation.
 _READ_TOOLS = frozenset({"Read", "read"})
+# Tool names that count as file activity (reset the quiet clock).
+_TOUCH_TOOLS = frozenset(
+    {"Read", "read", "Edit", "edit", "Write", "write", "MultiEdit", "NotebookEdit"}
+)
 
 
 @dataclass
-class HeldRead:
-    """Per-tool_use_id maturation state."""
+class MaturedRead:
+    """Replayed replacement for a matured Read."""
 
-    tool_use_id: str
-    file_path: str
-    first_seen_turn: int
-    content_hash: str
-    # Set when matured; replayed verbatim on every later request.
-    marker: str | None = None
-    ccr_hash: str | None = None
+    marker: str
+    ccr_hash: str
 
-    @property
-    def matured(self) -> bool:
-        return self.marker is not None
+
+@dataclass
+class _Activity:
+    """Per-request scan of tool activity, in assistant-turn units."""
+
+    # tool_use_id -> (file_path, assistant turn of the Read tool_use)
+    read_calls: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # file_path -> assistant turn of its most recent touch (read or edit)
+    file_last_touch: dict[str, int] = field(default_factory=dict)
+    # Total assistant messages in the conversation ("now").
+    assistant_count: int = 0
 
 
 @dataclass
@@ -75,7 +96,7 @@ class MaturationResult:
     # Message indices that contain still-holding Reads (must stay out of
     # the provider cache this request — feed to relocate_cache_breakpoint).
     holding_msg_indices: list[int] = field(default_factory=list)
-    newly_held: int = 0
+    holding_reads: int = 0
     newly_matured: int = 0
     replacements_applied: int = 0
     bytes_saved: int = 0
@@ -96,23 +117,20 @@ class ReadMaturationManager:
     ):
         self.config = config
         self.store = compression_store
-        self._held: dict[str, HeldRead] = {}
+        self._matured: dict[str, MaturedRead] = {}
 
     # ─── Per-request entry point ────────────────────────────────────────
 
     def apply(
         self,
         messages: list[dict[str, Any]],
-        turn_number: int,
         frozen_message_count: int = 0,
     ) -> MaturationResult:
-        """Observe fresh Reads, mature expired holds, apply replacements.
+        """Hold active Reads, mature quiet ones, replay matured markers.
 
         Args:
             messages: Conversation messages (Anthropic content-block or
                 OpenAI role="tool" formats).
-            turn_number: Monotonic per-session request counter (the
-                prefix tracker's turn number).
             frozen_message_count: Provider-cached message count. Reads
                 inside the frozen prefix were cache-written verbatim
                 before this mechanism saw them (e.g. it was just
@@ -122,7 +140,7 @@ class ReadMaturationManager:
         if not self.config.enabled:
             return result
 
-        read_ids = self._read_tool_ids(messages)
+        activity = self._scan_activity(messages)
         out: list[dict[str, Any]] = []
         any_changed = False
 
@@ -130,7 +148,7 @@ class ReadMaturationManager:
             if i < frozen_message_count:
                 out.append(msg)
                 continue
-            new_msg, msg_holding = self._process_message(msg, i, read_ids, turn_number, result)
+            new_msg, msg_holding = self._process_message(msg, activity, result)
             out.append(new_msg)
             if new_msg is not msg:
                 any_changed = True
@@ -143,42 +161,53 @@ class ReadMaturationManager:
 
     # ─── Internals ──────────────────────────────────────────────────────
 
-    def _read_tool_ids(self, messages: list[dict[str, Any]]) -> dict[str, str]:
-        """tool_use_id -> file_path for Read tool calls (both formats)."""
-        ids: dict[str, str] = {}
+    def _scan_activity(self, messages: list[dict[str, Any]]) -> _Activity:
+        """One pass over assistant messages: read calls, per-file last
+        touch, and the current assistant-turn count."""
+        act = _Activity()
         for msg in messages:
             if msg.get("role") != "assistant":
                 continue
+            act.assistant_count += 1
+            turn = act.assistant_count
+
             for tc in msg.get("tool_calls", []) or []:
                 if not isinstance(tc, dict):
                     continue
                 func = tc.get("function", {})
-                if func.get("name") in _READ_TOOLS:
-                    import json as _json
+                name = func.get("name", "")
+                if name not in _TOUCH_TOOLS:
+                    continue
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except (ValueError, TypeError):
+                    args = {}
+                fp = args.get("file_path") or args.get("path") or ""
+                if fp:
+                    act.file_last_touch[fp] = turn
+                if name in _READ_TOOLS:
+                    act.read_calls[tc.get("id", "")] = (fp, turn)
 
-                    try:
-                        args = _json.loads(func.get("arguments", "{}"))
-                    except (ValueError, TypeError):
-                        args = {}
-                    ids[tc.get("id", "")] = args.get("file_path") or args.get("path") or ""
             content = msg.get("content")
             if isinstance(content, list):
                 for b in content:
-                    if (
-                        isinstance(b, dict)
-                        and b.get("type") == "tool_use"
-                        and b.get("name") in _READ_TOOLS
-                    ):
-                        inp = b.get("input") or {}
-                        ids[b.get("id", "")] = inp.get("file_path") or inp.get("path") or ""
-        return ids
+                    if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                        continue
+                    name = b.get("name", "")
+                    if name not in _TOUCH_TOOLS:
+                        continue
+                    inp = b.get("input") or {}
+                    fp = inp.get("file_path") or inp.get("path") or ""
+                    if fp:
+                        act.file_last_touch[fp] = turn
+                    if name in _READ_TOOLS:
+                        act.read_calls[b.get("id", "")] = (fp, turn)
+        return act
 
     def _process_message(
         self,
         msg: dict[str, Any],
-        msg_index: int,
-        read_ids: dict[str, str],
-        turn_number: int,
+        activity: _Activity,
         result: MaturationResult,
     ) -> tuple[dict[str, Any], bool]:
         """Returns (possibly-replaced message, message_still_holding)."""
@@ -188,10 +217,8 @@ class ReadMaturationManager:
         # OpenAI format: whole message is one tool result.
         if role == "tool":
             tc_id = msg.get("tool_call_id", "")
-            if tc_id in read_ids and isinstance(content, str):
-                new_content, holding = self._handle_read(
-                    tc_id, read_ids[tc_id], content, turn_number, result
-                )
+            if tc_id in activity.read_calls and isinstance(content, str):
+                new_content, holding = self._handle_read(tc_id, content, activity, result)
                 if new_content is not None:
                     return {**msg, "content": new_content}, holding
                 return msg, holding
@@ -206,14 +233,12 @@ class ReadMaturationManager:
                 if (
                     isinstance(b, dict)
                     and b.get("type") == "tool_result"
-                    and b.get("tool_use_id", "") in read_ids
+                    and b.get("tool_use_id", "") in activity.read_calls
                     and isinstance(b.get("content"), str)
                     and "cache_control" not in b
                 ):
                     tc_id = b["tool_use_id"]
-                    new_content, holding = self._handle_read(
-                        tc_id, read_ids[tc_id], b["content"], turn_number, result
-                    )
+                    new_content, holding = self._handle_read(tc_id, b["content"], activity, result)
                     holding_any = holding_any or holding
                     if new_content is not None:
                         new_blocks.append({**b, "content": new_content})
@@ -229,23 +254,20 @@ class ReadMaturationManager:
     def _handle_read(
         self,
         tc_id: str,
-        file_path: str,
         content: str,
-        turn_number: int,
+        activity: _Activity,
         result: MaturationResult,
     ) -> tuple[str | None, bool]:
         """Returns (replacement_content | None, still_holding)."""
-        state = self._held.get(tc_id)
+        matured = self._matured.get(tc_id)
 
         # Matured earlier: replay the recorded marker deterministically.
-        if state is not None and state.matured:
-            # Already-replaced content (replayed from a compression cache
-            # upstream) passes through; otherwise substitute.
-            if content == state.marker:
+        if matured is not None:
+            if content == matured.marker:
                 return None, False
             result.replacements_applied += 1
-            result.bytes_saved += max(0, len(content) - len(state.marker or ""))
-            return state.marker, False
+            result.bytes_saved += max(0, len(content) - len(matured.marker))
+            return matured.marker, False
 
         size = len(content.encode("utf-8", errors="replace"))
         if size < self.config.min_size_bytes:
@@ -255,24 +277,17 @@ class ReadMaturationManager:
         if "Retrieve original: hash=" in content or "Retrieve more: hash=" in content:
             return None, False
 
-        if state is None:
-            # First sight: register and hold out of the cache.
-            self._held[tc_id] = HeldRead(
-                tool_use_id=tc_id,
-                file_path=file_path,
-                first_seen_turn=turn_number,
-                content_hash=hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[
-                    :24
-                ],
-            )
-            result.newly_held += 1
-            return None, True
+        file_path, read_turn = activity.read_calls[tc_id]
+        last_touch = activity.file_last_touch.get(file_path, read_turn)
+        quiet_turns = activity.assistant_count - last_touch
+        held_turns = activity.assistant_count - read_turn
 
-        if turn_number - state.first_seen_turn < self.config.hold_requests:
-            return None, True  # still in the verbatim window
+        if quiet_turns < self.config.quiesce_turns and held_turns < self.config.max_hold_turns:
+            result.holding_reads += 1
+            return None, True  # file still active — keep verbatim, uncached
 
-        # Hold expired: mature. Store the original, record the marker.
-        ccr_hash = state.content_hash
+        # File quiesced (or hold cap hit): mature.
+        ccr_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
         if self.store is not None:
             try:
                 ccr_hash = self.store.store(
@@ -288,15 +303,15 @@ class ReadMaturationManager:
         file_display = file_path or "unknown"
         # NOTE: "Retrieve original: hash=" is load-bearing (marker-
         # preserving regex + ContentRouter compression pinning).
-        state.marker = (
+        marker = (
             f"[Read of {file_display} compressed after use — re-read the file "
             f"if needed. Retrieve original: hash={ccr_hash}]"
         )
-        state.ccr_hash = ccr_hash
+        self._matured[tc_id] = MaturedRead(marker=marker, ccr_hash=ccr_hash)
         result.newly_matured += 1
         result.replacements_applied += 1
-        result.bytes_saved += max(0, len(content) - len(state.marker))
-        return state.marker, False
+        result.bytes_saved += max(0, len(content) - len(marker))
+        return marker, False
 
 
 def relocate_cache_breakpoint(

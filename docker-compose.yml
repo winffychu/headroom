@@ -1,53 +1,70 @@
+version: "3.8"
+
 services:
-  headroom-proxy:
-    build: .
-    command: ["--host", "0.0.0.0"]
-    environment:
-      - HEADROOM_HOST=0.0.0.0
-      # if you want to use a custom OpenAI-compatible API endpoint,
-      # uncomment and set the following line with the desired URL
-      # - OPENAI_TARGET_API_URL=https://api.x.ai
+  headroom:
+    image: ghcr.io/chopratejas/headroom:latest
+    container_name: headroom
+    restart: unless-stopped
+
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"        # 仅本机访问，不暴露到外网
+
+    environment:
+      # ─── 上游路由 ───────────────────────────────────────────
+      # Claude Code / Anthropic 格式请求 → sub2api 中转站
+      ANTHROPIC_TARGET_API_URL: "https://sub2api.example.com"
+      # Codex / OAI 格式请求 → new-api 中转站
+      OPENAI_TARGET_API_URL: "https://new-api.example.com/v1"
+      # Gemini 请求（带 x-goog-api-key）→ gemini 中转站
+      GEMINI_TARGET_API_URL: "https://gemini-proxy.example.com"
+      # Vertex AI（如有需要）
+      VERTEX_TARGET_API_URL: ""
+      # Bedrock（如有需要）
+      BEDROCK_TARGET_API_URL: ""
+      # Codex 订阅用户的 ChatGPT 回退路由
+      #（无需设置，默认 https://chatgpt.com）
+
+      # ─── 网络与绑定 ────────────────────────────────────────
+      HEADROOM_HOST: "0.0.0.0"        # 容器内监听所有网卡
+      HEADROOM_PORT: "8787"           # 代理端口
+      HEADROOM_MAX_CONNECTIONS: "500" # 最大上游 HTTP 连接数
+      HEADROOM_HTTP2: "true"          # 启用 HTTP/2
+
+      # ─── 压缩模式 ──────────────────────────────────────────
+      # token 模式：激进压缩（PAYG 用户推荐）
+      # subscription 模式：不压缩（订阅制用户）
+      # passthrough 模式：不压缩，仅透传
+      HEADROOM_MODE: "token"
+
+      # ─── 预算与速率限制（安全兜底）────────────────────────
+      HEADROOM_BUDGET: "100.0"        # 每日预算上限（美元）
+      HEADROOM_BUDGET_PERIOD: "daily" # 周期：daily / weekly / monthly
+
+      # ─── 压缩微调 ──────────────────────────────────────────
+      HEADROOM_TARGET_RATIO: ""       # 目标压缩率（如 0.3 = 保留30%）
+      HEADROOM_DISABLE_KOMPRESS: "false"
+      HEADROOM_OUTPUT_SHAPER: "1"     # 输出侧 token 裁剪
+
+      # ─── 日志 ──────────────────────────────────────────────
+      # PYTHONUNBUFFERED 是镜像自带的，无需重复设置
+
     volumes:
-      - headroom_workspace:/home/nonroot/.headroom
+      # 持久化 ~/.headroom（内存数据库、TOIN 学习数据等）
+      - headroom-data:/home/nonroot/.headroom
+
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
       interval: 30s
       timeout: 5s
-      retries: 3
       start_period: 20s
-    depends_on:
-      - qdrant
-      - neo4j
+      retries: 3
 
-  # Vector database for semantic search
-  qdrant:
-    image: qdrant/qdrant:v1.17.1
-    ports:
-      - "6333:6333"  # REST API
-      - "6334:6334"  # gRPC
-    volumes:
-      - qdrant_data:/qdrant/storage
-    environment:
-      - QDRANT__SERVICE__GRPC_PORT=6334
-
-  # Graph database for relationships and multi-hop reasoning
-  neo4j:
-    image: neo4j:5.26
-    ports:
-      - "7474:7474"  # HTTP (Browser)
-      - "7687:7687"  # Bolt
-    volumes:
-      - neo4j_data:/data
-    environment:
-      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/devpassword}
-      - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_apoc_export_file_enabled=true
-      - NEO4J_apoc_import_file_enabled=true
-      - NEO4J_apoc_import_file_use__neo4j__config=true
+    # 资源限制（按需调整）
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2G
+    #       cpus: "2"
 
 volumes:
-  headroom_workspace:    # persists proxy_savings, memory.db, session_stats, toin across image updates
-  qdrant_data:
-  neo4j_data:
+  headroom-data:

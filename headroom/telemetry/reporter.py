@@ -98,7 +98,8 @@ class UsageReporter:
     def __init__(
         self,
         license_key: str,
-        cloud_url: str = "https://app.headroomlabs.ai",
+        # [PATCHED] Cloud reporter disabled
+cloud_url: str = "http://127.0.0.1",
         report_interval: int = 300,
         cache_path: Path | None = None,
     ):

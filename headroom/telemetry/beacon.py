@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # Supabase endpoint for anonymous aggregate telemetry.
 # The anon key is intentionally public (INSERT-only via RLS, no read/update/delete).
 # Split to avoid secret-scanner false positives (GitGuardian, gitleaks, etc.).
-_SUPABASE_URL = "https://dtlllcsudcoasebbamcq.supabase.co"
+# [PATCHED] Telemetry disabled - redirected to localhost
+_SUPABASE_URL = "http://127.0.0.1"
 _SUPABASE_KEY = ".".join(
     [
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",

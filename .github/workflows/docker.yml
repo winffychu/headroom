@@ -31,6 +31,23 @@ permissions:
   id-token: write # For cosign keyless signing via Sigstore OIDC
 
 jobs:
+  # ─── Dynamic variant selection ─────────────────────────────
+  # On push (default): only slim-nonroot + code-slim-nonroot
+  # On workflow_dispatch / release: all 8 variants
+  set-variants:
+    runs-on: ubuntu-24.04
+    outputs:
+      variants: ${{ steps.set.outputs.variants }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "release" ]; then
+            MATRIX='[{"name":"","bake_target":"runtime"},{"name":"nonroot","bake_target":"runtime-nonroot"},{"name":"code","bake_target":"runtime-code"},{"name":"code-nonroot","bake_target":"runtime-code-nonroot"},{"name":"slim","bake_target":"runtime-slim"},{"name":"slim-nonroot","bake_target":"runtime-slim-nonroot"},{"name":"code-slim","bake_target":"runtime-code-slim"},{"name":"code-slim-nonroot","bake_target":"runtime-code-slim-nonroot"}]'
+          else
+            MATRIX='[{"name":"slim-nonroot","bake_target":"runtime-slim-nonroot"},{"name":"code-slim-nonroot","bake_target":"runtime-code-slim-nonroot"}]'
+          fi
+          echo "variants=$MATRIX" >> "$GITHUB_OUTPUT"
+
   # ─── Per-arch fan-out ──────────────────────────────────────────────────────
   # Build each variant on its native architecture in parallel:
   #   linux/amd64 → ubuntu-24.04 (native x86_64)
@@ -45,20 +62,13 @@ jobs:
   # `docker-manifest` job below combines the per-arch digests into the
   # final multi-arch tagged manifest, which is what users pull by tag.
   docker-build:
+    needs: set-variants
     runs-on: ${{ matrix.arch.runs_on }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        variant:
-          - { name: "", bake_target: runtime }
-          - { name: nonroot, bake_target: runtime-nonroot }
-          - { name: code, bake_target: runtime-code }
-          - { name: code-nonroot, bake_target: runtime-code-nonroot }
-          - { name: slim, bake_target: runtime-slim }
-          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
-          - { name: code-slim, bake_target: runtime-code-slim }
-          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
+        variant: ${{ fromJSON(needs.set-variants.outputs.variants) }}
         arch:
           - { name: amd64, runs_on: ubuntu-24.04, platform: linux/amd64 }
           - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
@@ -211,21 +221,13 @@ jobs:
   # into a single multi-arch index manifest, applies the metadata-action
   # tags, and that manifest is what users pull by `:tag`.
   docker-manifest:
-    needs: docker-build
+    needs: [set-variants, docker-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        variant:
-          - { name: "", bake_target: runtime }
-          - { name: nonroot, bake_target: runtime-nonroot }
-          - { name: code, bake_target: runtime-code }
-          - { name: code-nonroot, bake_target: runtime-code-nonroot }
-          - { name: slim, bake_target: runtime-slim }
-          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
-          - { name: code-slim, bake_target: runtime-code-slim }
-          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
+        variant: ${{ fromJSON(needs.set-variants.outputs.variants) }}
 
     steps:
       # No `actions/checkout` here: the manifest job only calls
@@ -379,6 +381,9 @@ jobs:
     # variant manifest job has finished, so GHCR's package version
     # listing (sorted by created_at) shows the root image with :latest
     # at the top instead of whichever variant happened to finish last.
+    # Only runs on full builds (workflow_dispatch/release) since slim-only
+    # builds don't produce a root variant.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
     needs: docker-manifest
     runs-on: ubuntu-24.04
     timeout-minutes: 10

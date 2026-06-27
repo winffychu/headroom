@@ -433,6 +433,18 @@ def _build_agent_usage_summary(
 # PyTorch is optional in headroom; the warning is not actionable for operators.
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
+import os as _hr_log_os
+
+_headroom_log_file = _hr_log_os.environ.get("HEADROOM_LOG_FILE")
+if _headroom_log_file:
+    try:
+        from logging.handlers import RotatingFileHandler as _HR_RFH
+        _hr_rfh = _HR_RFH(_headroom_log_file, maxBytes=10*1024*1024, backupCount=3)
+        _hr_rfh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logging.getLogger().addHandler(_hr_rfh)
+    except Exception:
+        pass
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )

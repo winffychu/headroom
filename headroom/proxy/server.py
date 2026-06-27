@@ -438,17 +438,6 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-# Send standard logging to file so throughput and perf analysis work
-try:
-    from headroom import paths as _hr_paths
-    _hr_log_file = _hr_paths.proxy_log_path()
-    _hr_log_file.parent.mkdir(parents=True, exist_ok=True)
-    from logging.handlers import RotatingFileHandler as _HRF
-    _hr_rfh = _HRF(str(_hr_log_file), maxBytes=10*1024*1024, backupCount=3)
-    _hr_rfh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logging.getLogger().addHandler(_hr_rfh)
-except Exception:
-    pass
 logger = logging.getLogger("headroom.proxy")
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
